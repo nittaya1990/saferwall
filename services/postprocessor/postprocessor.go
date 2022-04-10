@@ -1,4 +1,4 @@
-// Copyright 2021 Saferwall. All rights reserved.
+// Copyright 2022 Saferwall. All rights reserved.
 // Use of this source code is governed by Apache v2 license
 // license that can be found in the LICENSE file.
 
@@ -8,14 +8,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"time"
 
+	"github.com/blackironj/periodic"
+	"github.com/djherbis/times"
 	gonsq "github.com/nsqio/go-nsq"
-	"github.com/saferwall/saferwall/pkg/db"
-	"github.com/saferwall/saferwall/pkg/log"
-	"github.com/saferwall/saferwall/pkg/ml"
-	"github.com/saferwall/saferwall/pkg/pubsub"
-	"github.com/saferwall/saferwall/pkg/pubsub/nsq"
+	"github.com/saferwall/saferwall/internal/log"
+	"github.com/saferwall/saferwall/internal/pubsub"
+	"github.com/saferwall/saferwall/internal/pubsub/nsq"
+	"github.com/saferwall/saferwall/internal/db"
+	"github.com/saferwall/saferwall/internal/ml"
 	"github.com/saferwall/saferwall/services/config"
 	pb "github.com/saferwall/saferwall/services/proto"
 	"google.golang.org/protobuf/proto"
@@ -23,11 +27,12 @@ import (
 
 // Config represents our application config.
 type Config struct {
-	LogLevel  string             `mapstructure:"log_level"`
-	MLAddress string             `mapstructure:"ml_address"`
-	DB        db.Config          `mapstructure:"db"`
-	Producer  config.ProducerCfg `mapstructure:"producer"`
-	Consumer  config.ConsumerCfg `mapstructure:"consumer"`
+	LogLevel     string             `mapstructure:"log_level"`
+	MLAddress    string             `mapstructure:"ml_address"`
+	SharedVolume string             `mapstructure:"shared_volume"`
+	DB           db.Config          `mapstructure:"db"`
+	Producer     config.ProducerCfg `mapstructure:"producer"`
+	Consumer     config.ConsumerCfg `mapstructure:"consumer"`
 }
 
 // Service represents the PE scan service. It adheres to the nsq.Handler
@@ -78,12 +83,59 @@ func (s *Service) Start() error {
 	s.logger.Infof("start consuming from topic: %s ...", s.cfg.Consumer.Topic)
 	s.sub.Start()
 
+	// start a background job that deletes samples from
+	// the nfs share that has not been accessed since
+	// more than a day.
+	scheduler := periodic.NewScheduler()
+	cleanupStorage, _ := periodic.NewTask(deleteOldSamples, s.cfg.SharedVolume)
+	scheduler.RegisterTask("cleanupStorageTask", time.Hour*24, cleanupStorage)
+	scheduler.Run()
+
+	//Stop tasks before program is shutting down
+	defer func() {
+		scheduler.Stop()
+		s.logger.Info("every task is stopped")
+	}()
 	return nil
 }
 
 func toJSON(v interface{}) []byte {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+func deleteOldSamples(logger log.Logger, root string) {
+	var files []string
+
+	logger.Info("run cleanup samples from storage task")
+
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		files = append(files, path)
+		return nil
+	})
+	if err != nil {
+		logger.Errorf("error while walk storage dir: %s, reason: %v", root, err)
+		return
+	}
+
+	yesterday := time.Now().AddDate(0, 0, -1)
+
+	for _, file := range files {
+		t, err := times.Stat(file)
+		if err != nil {
+			logger.Errorf("error while time stating file: %s, reason: %v", file, err)
+			continue
+		}
+		if t.AccessTime().Before(yesterday) {
+			err = os.Remove(file)
+			if err != nil {
+				logger.Errorf("error while deleting file: %s, reason: %v", file, err)
+				continue
+			}
+
+			logger.Infof("file: %s has been cleaned up from the storage", file)
+		}
+	}
 }
 
 // HandleMessage is the only requirement needed to fulfill the nsq.Handler.
@@ -109,10 +161,11 @@ func (s *Service) HandleMessage(m *gonsq.Message) error {
 			logger.Errorf("failed to read document: %v", err)
 		}
 		logger.Debugf("finish av scanners: %d", len(multiav))
-		if len(multiav) > 11 {
+		if len(multiav) == 14 {
 			break
 		}
 	}
+
 	var file map[string]interface{}
 	err := s.db.Get(ctx, sha256, &file)
 	if err != nil {
@@ -120,10 +173,14 @@ func (s *Service) HandleMessage(m *gonsq.Message) error {
 		return err
 	}
 
+	// set the file analysis status to `finished` and
+	// set the `last_scan` to now.
 	payloads := []*pb.Message_Payload{
 		{Module: "status", Body: toJSON(2)},
+		{Module: "last_scanned", Body: toJSON(time.Now().Unix())},
 	}
 
+	// if the file format is PE, run the ML classifier.
 	if file["fileformat"] == "pe" {
 		if _, ok := file["pe"]; ok {
 			res, err := ml.PEClassPrediction(s.cfg.MLAddress, toJSON(file))
@@ -136,6 +193,7 @@ func (s *Service) HandleMessage(m *gonsq.Message) error {
 		}
 	}
 
+	// update multiav last_scan and first_scan if needed.
 	if _, ok := file["multiav"]; ok {
 		logger.Debugf("multiav res: %v", file["multiav"])
 		multiav := file["multiav"].(map[string]interface{})
@@ -153,6 +211,7 @@ func (s *Service) HandleMessage(m *gonsq.Message) error {
 		}
 	}
 
+	// serialize the message using protobuf.
 	msg := &pb.Message{Sha256: sha256, Payload: payloads}
 	out, err := proto.Marshal(msg)
 	if err != nil {
@@ -160,6 +219,7 @@ func (s *Service) HandleMessage(m *gonsq.Message) error {
 		return err
 	}
 
+	// finally, produce the message to the right queue.
 	err = s.pub.Publish(ctx, s.cfg.Producer.Topic, out)
 	if err != nil {
 		logger.Errorf("failed to publish message: %v", err)

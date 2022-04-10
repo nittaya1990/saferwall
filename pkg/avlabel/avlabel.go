@@ -1,4 +1,4 @@
-// Copyright 2021 Saferwall. All rights reserved.
+// Copyright 2022 Saferwall. All rights reserved.
 // Use of this source code is governed by Apache v2 license
 // license that can be found in the LICENSE file.
 
@@ -97,4 +97,18 @@ func ParseAvira(detection string) Detection {
 		Family:   params["Family"],
 		Variant:  params["Variant"],
 	}
+}
+
+// Parse parses an Antivirus detection name.
+func Parse(av, detection string) Detection {
+	switch av {
+	case "windefender":
+		return ParseWindefender(detection)
+	case "eset":
+		return ParseEset(detection)
+	case "avira":
+		return ParseAvira(detection)
+	}
+
+	return Detection{}
 }

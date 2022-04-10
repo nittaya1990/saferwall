@@ -18,7 +18,7 @@ RUN apk update && apk add --no-cache git ca-certificates tzdata \
 WORKDIR $GOPATH/src/saferwall/$VENDOR/
 
 # Allow using private github repos that have private go modules.
-RUN go env -w GOPRIVATE=github.com/saferwall/multiav \
+RUN go env -w GOPRIVATE=github.com/saferwall/* \
 	&& git config --global url."https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com".insteadOf "https://github.com"
 
 # Copy go mod and sum files.
@@ -53,7 +53,7 @@ WORKDIR /saferwall
 
 # Update virus definition file.
 RUN $SOPHOS_INSTALL_DIR/update/savupdate.sh \
-    && echo -n "$(date +%s)" >> $SOPHOS_DB_UPDATE_DATE
+    || echo -n "$(date +%s)" >> $SOPHOS_DB_UPDATE_DATE
 
 # Performs a simple detection test.
 RUN $SOPHOS_SCANNER -f -nc -nb -ss -archive -loopback \
